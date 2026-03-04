@@ -162,9 +162,25 @@ jobs:
           echo "Derived Sparkle public key: $DERIVED_PUBLIC_KEY"
           echo "SPARKLE_PUBLIC_KEY=$DERIVED_PUBLIC_KEY" >> "$GITHUB_ENV"
 
-      - name: Build app (Release)
+      - name: Build app (Release, universal)
         run: |
-          xcodebuild -scheme cmux -configuration Release -derivedDataPath build CODE_SIGNING_ALLOWED=NO ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon-Nightly build
+          xcodebuild -scheme cmux -configuration Release -derivedDataPath build CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon-Nightly build
+
+      - name: Verify universal binary
+        run: |
+          APP_BINARY="build/Build/Products/Release/cmux.app/Contents/MacOS/cmux"
+          echo "Checking architectures in $APP_BINARY..."
+          ARCHS="$(lipo -archs "$APP_BINARY")"
+          echo "Architectures: $ARCHS"
+          if ! echo "$ARCHS" | grep -q "x86_64"; then
+            echo "ERROR: x86_64 architecture missing from universal binary" >&2
+            exit 1
+          fi
+          if ! echo "$ARCHS" | grep -q "arm64"; then
+            echo "ERROR: arm64 architecture missing from universal binary" >&2
+            exit 1
+          fi
+          echo "Universal binary verified: $ARCHS"
 
       - name: Inject nightly identity and metadata
         run: |

@@ -60,8 +60,8 @@ echo "Pre-flight checks passed"
 
 # --- Build GhosttyKit (if needed) ---
 if [ ! -d "GhosttyKit.xcframework" ]; then
-  echo "Building GhosttyKit..."
-  cd ghostty && zig build -Demit-xcframework=true -Demit-macos-app=false -Dxcframework-target=native -Doptimize=ReleaseFast && cd ..
+  echo "Building GhosttyKit (universal)..."
+  cd ghostty && zig build -Demit-xcframework=true -Demit-macos-app=false -Doptimize=ReleaseFast && cd ..
   rm -rf GhosttyKit.xcframework
   cp -R ghostty/macos/GhosttyKit.xcframework GhosttyKit.xcframework
 else
@@ -71,7 +71,12 @@ fi
 # --- Build app (Release, unsigned) ---
 echo "Building app..."
 rm -rf build/
-xcodebuild -scheme cmux -configuration Release -derivedDataPath build CODE_SIGNING_ALLOWED=NO build 2>&1 | tail -5
+xcodebuild -scheme cmux -configuration Release -derivedDataPath build CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO build 2>&1 | tail -5
+echo "Verifying universal binary..."
+ARCHS="$(lipo -archs "$APP_PATH/Contents/MacOS/cmux")"
+echo "Architectures: $ARCHS"
+echo "$ARCHS" | grep -q "x86_64" || { echo "ERROR: x86_64 missing" >&2; exit 1; }
+echo "$ARCHS" | grep -q "arm64" || { echo "ERROR: arm64 missing" >&2; exit 1; }
 echo "Build succeeded"
 
 # --- Inject Sparkle keys ---
