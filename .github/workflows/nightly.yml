@@ -150,14 +150,26 @@ jobs:
           mkdir -p "$CACHE_DIR"
           echo "SWIFTPM_CACHE_PATH=$CACHE_DIR" >> "$GITHUB_ENV"
 
+      - name: Check signing secrets availability
+        id: check_secrets
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          if [ -n "$SPARKLE_PRIVATE_KEY" ] && [ -n "$APPLE_CERTIFICATE_BASE64" ] && [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "has_signing_secrets=true" >> "$GITHUB_OUTPUT"
+            echo "All signing secrets available"
+          else
+            echo "has_signing_secrets=false" >> "$GITHUB_OUTPUT"
+            echo "Signing secrets not available -- will produce unsigned DMG"
+          fi
+
       - name: Derive Sparkle public key from private key
+        if: steps.check_secrets.outputs.has_signing_secrets == 'true'
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
-          if [ -z "$SPARKLE_PRIVATE_KEY" ]; then
-            echo "Missing SPARKLE_PRIVATE_KEY secret" >&2
-            exit 1
-          fi
           DERIVED_PUBLIC_KEY=$(swift scripts/derive_sparkle_public_key.swift "$SPARKLE_PRIVATE_KEY")
           echo "Derived Sparkle public key: $DERIVED_PUBLIC_KEY"
           echo "SPARKLE_PUBLIC_KEY=$DERIVED_PUBLIC_KEY" >> "$GITHUB_ENV"
@@ -200,11 +212,13 @@ jobs:
           # Update plist path after rename
           APP_PLIST="${APP_DIR}/cmux NIGHTLY.app/Contents/Info.plist"
 
-          # --- Sparkle: point at the nightly appcast ---
+          # --- Sparkle: point at the nightly appcast (only if keys available) ---
           /usr/libexec/PlistBuddy -c "Delete :SUPublicEDKey" "$APP_PLIST" >/dev/null 2>&1 || true
           /usr/libexec/PlistBuddy -c "Delete :SUFeedURL" "$APP_PLIST" >/dev/null 2>&1 || true
-          /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string ${SPARKLE_PUBLIC_KEY}" "$APP_PLIST"
-          /usr/libexec/PlistBuddy -c "Add :SUFeedURL string https://github.com/manaflow-ai/cmux/releases/download/nightly/appcast.xml" "$APP_PLIST"
+          if [ -n "${SPARKLE_PUBLIC_KEY:-}" ]; then
+            /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string ${SPARKLE_PUBLIC_KEY}" "$APP_PLIST"
+            /usr/libexec/PlistBuddy -c "Add :SUFeedURL string https://github.com/manaflow-ai/cmux/releases/download/nightly/appcast.xml" "$APP_PLIST"
+          fi
 
           # Marketing version: append -nightly.YYYYMMDD so users can identify the channel and date
           BASE_MARKETING=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PLIST")
@@ -238,19 +252,31 @@ jobs:
           echo "Nightly immutable DMG: ${NIGHTLY_DMG_IMMUTABLE}"
           echo "Commit SHA: ${SHORT_SHA}"
 
+      # --- Unsigned DMG path (forks without signing secrets) ---
+
+      - name: Create unsigned DMG
+        if: steps.check_secrets.outputs.has_signing_secrets != 'true'
+        run: |
+          APP_PATH="build/Build/Products/Release/cmux NIGHTLY.app"
+          create-dmg "$APP_PATH" ./ || true
+          mv ./"cmux NIGHTLY"*.dmg "cmux-nightly-macos.dmg" 2>/dev/null || mv ./cmux*.dmg "cmux-nightly-macos.dmg"
+          echo "Created unsigned DMG: cmux-nightly-macos.dmg"
+
+      - name: Upload unsigned DMG as artifact
+        if: steps.check_secrets.outputs.has_signing_secrets != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cmux-nightly-macos-unsigned
+          path: cmux-nightly-macos.dmg
+
+      # --- Signed + notarized path (upstream with secrets) ---
+
       - name: Import signing cert
+        if: steps.check_secrets.outputs.has_signing_secrets == 'true'
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
-          if [ -z "$APPLE_CERTIFICATE_BASE64" ]; then
-            echo "Missing APPLE_CERTIFICATE_BASE64 secret" >&2
-            exit 1
-          fi
-          if [ -z "$APPLE_CERTIFICATE_PASSWORD" ]; then
-            echo "Missing APPLE_CERTIFICATE_PASSWORD secret" >&2
-            exit 1
-          fi
           KEYCHAIN_PASSWORD="$(uuidgen)"
           echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > /tmp/cert.p12
           security delete-keychain build.keychain >/dev/null 2>&1 || true
@@ -262,13 +288,10 @@ jobs:
           security list-keychains -d user -s build.keychain
 
       - name: Codesign app
+        if: steps.check_secrets.outputs.has_signing_secrets == 'true'
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
-            echo "Missing APPLE_SIGNING_IDENTITY secret" >&2
-            exit 1
-          fi
           APP_PATH="build/Build/Products/Release/cmux NIGHTLY.app"
           ENTITLEMENTS="cmux.entitlements"
           CLI_PATH="$APP_PATH/Contents/Resources/bin/cmux"
@@ -279,16 +302,13 @@ jobs:
           /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
       - name: Notarize app and dmg
+        if: steps.check_secrets.outputs.has_signing_secrets == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          if [ -z "$APPLE_ID" ] || [ -z "$APPLE_APP_SPECIFIC_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
-            echo "Missing notarization secrets (APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID)" >&2
-            exit 1
-          fi
           APP_PATH="build/Build/Products/Release/cmux NIGHTLY.app"
           ZIP_SUBMIT="cmux-nightly-notary.zip"
           DMG_RELEASE="cmux-nightly-macos.dmg"
@@ -326,6 +346,7 @@ jobs:
           cp "$DMG_RELEASE" "$NIGHTLY_DMG_IMMUTABLE"
 
       - name: Upload dSYMs to Sentry
+        if: steps.check_secrets.outputs.has_signing_secrets == 'true'
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           SENTRY_ORG: manaflow
@@ -339,16 +360,14 @@ jobs:
           sentry-cli debug-files upload --include-sources build/Build/Products/Release/
 
       - name: Generate Sparkle appcast (nightly)
+        if: steps.check_secrets.outputs.has_signing_secrets == 'true'
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
-          if [ -z "$SPARKLE_PRIVATE_KEY" ]; then
-            echo "Missing SPARKLE_PRIVATE_KEY secret" >&2
-            exit 1
-          fi
           ./scripts/sparkle_generate_appcast.sh "$NIGHTLY_DMG_IMMUTABLE" nightly appcast.xml
 
       - name: Move nightly tag to built commit
+        if: steps.check_secrets.outputs.has_signing_secrets == 'true'
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -357,6 +376,7 @@ jobs:
           git push origin refs/tags/nightly --force
 
       - name: Publish nightly release assets
+        if: steps.check_secrets.outputs.has_signing_secrets == 'true'
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
         with:
           tag_name: nightly
